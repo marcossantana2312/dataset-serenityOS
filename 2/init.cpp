@@ -1,165 +1,64 @@
-#include "types.h"
-#include "kmalloc.h"
-#include "i386.h"
-#include "i8253.h"
-#include "Keyboard.h"
+#include "KSyms.h"
 #include "Process.h"
-#include "system.h"
-#include "PIC.h"
-#include "StdLib.h"
-#include "Syscall.h"
-#include "CMOS.h"
-#include "IDEDiskDevice.h"
-#include <VirtualFileSystem/NullDevice.h>
-#include <VirtualFileSystem/ZeroDevice.h>
-#include <VirtualFileSystem/FullDevice.h>
-#include <VirtualFileSystem/RandomDevice.h>
-#include <VirtualFileSystem/Ext2FileSystem.h>
-#include <VirtualFileSystem/VirtualFileSystem.h>
-#include <VirtualFileSystem/FileDescriptor.h>
-#include <AK/OwnPtr.h>
-#include "MemoryManager.h"
-#include <ELFLoader/ELFLoader.h>
-#include "Console.h"
-#include "ProcFileSystem.h"
 #include "RTC.h"
-#include "VirtualConsole.h"
 #include "Scheduler.h"
+#include "kmalloc.h"
+#include <AK/Types.h>
+#include <Kernel/Arch/i386/CPU.h>
+#include <Kernel/Arch/i386/PIC.h>
+#include <Kernel/Arch/i386/PIT.h>
+#include <Kernel/Devices/BXVGADevice.h>
+#include <Kernel/Devices/DebugLogDevice.h>
+#include <Kernel/Devices/DiskPartition.h>
+#include <Kernel/Devices/FullDevice.h>
+#include <Kernel/Devices/IDEDiskDevice.h>
+#include <Kernel/Devices/KeyboardDevice.h>
+#include <Kernel/Devices/MBRPartitionTable.h>
+#include <Kernel/Devices/NullDevice.h>
+#include <Kernel/Devices/PS2MouseDevice.h>
+#include <Kernel/Devices/SB16.h>
+#include <Kernel/Devices/RandomDevice.h>
+#include <Kernel/Devices/SerialDevice.h>
+#include <Kernel/Devices/ZeroDevice.h>
+#include <Kernel/FileSystem/DevPtsFS.h>
+#include <Kernel/FileSystem/Ext2FileSystem.h>
+#include <Kernel/FileSystem/ProcFS.h>
+#include <Kernel/FileSystem/VirtualFileSystem.h>
+#include <Kernel/KParams.h>
+#include <Kernel/Multiboot.h>
+#include <Kernel/Net/E1000NetworkAdapter.h>
+#include <Kernel/Net/NetworkTask.h>
+#include <Kernel/TTY/PTYMultiplexer.h>
+#include <Kernel/TTY/VirtualConsole.h>
+#include <Kernel/VM/MemoryManager.h>
 
-#define KSYMS
-#define SPAWN_MULTIPLE_SHELLS
 //#define STRESS_TEST_SPAWNING
-
-system_t system;
 
 VirtualConsole* tty0;
 VirtualConsole* tty1;
 VirtualConsole* tty2;
 VirtualConsole* tty3;
-Keyboard* keyboard;
-
-static byte parseHexDigit(char nibble)
-{
-    if (nibble >= '0' && nibble <= '9')
-        return nibble - '0';
-    ASSERT(nibble >= 'a' && nibble <= 'f');
-    return 10 + (nibble - 'a');
-}
-
-#ifdef KSYMS
-static Vector<KSym, KmallocEternalAllocator>* s_ksyms;
-static bool s_ksyms_ready;
-
-Vector<KSym, KmallocEternalAllocator>& ksyms()
-{
-    return *s_ksyms;
-}
-
-bool ksyms_ready()
-{
-    return s_ksyms_ready;
-}
-
-const KSym* ksymbolicate(dword address)
-{
-    if (address < ksyms().first().address || address > ksyms().last().address)
-        return nullptr;
-    for (unsigned i = 0; i < ksyms().size(); ++i) {
-        if (address < ksyms()[i + 1].address)
-            return &ksyms()[i];
-    }
-    return nullptr;
-}
-
-static void loadKsyms(const ByteBuffer& buffer)
-{
-    // FIXME: It's gross that this vector grows dynamically rather than being sized-to-fit.
-    //        We're wasting that eternal kmalloc memory.
-    s_ksyms = new Vector<KSym, KmallocEternalAllocator>;
-    auto* bufptr = (const char*)buffer.pointer();
-    auto* startOfName = bufptr;
-    dword address = 0;
-    dword ksym_count = 0;
-
-    for (unsigned i = 0; i < 8; ++i)
-        ksym_count = (ksym_count << 4) | parseHexDigit(*(bufptr++));
-    s_ksyms->ensureCapacity(ksym_count);
-    ++bufptr; // skip newline
-
-    kprintf("Loading ksyms: \033[s");
-
-    while (bufptr < buffer.endPointer()) {
-        for (unsigned i = 0; i < 8; ++i)
-            address = (address << 4) | parseHexDigit(*(bufptr++));
-        bufptr += 3;
-        startOfName = bufptr;
-        while (*(++bufptr)) {
-            if (*bufptr == '\n') {
-                break;
-            }
-        }
-        // FIXME: The Strings here should be eternally allocated too.
-        ksyms().append({ address, String(startOfName, bufptr - startOfName) });
-
-        if ((ksyms().size() % 10) == 0 || ksym_count == ksyms().size())
-            kprintf("\033[u\033[s%u/%u", ksyms().size(), ksym_count);
-        ++bufptr;
-    }
-    kprintf("\n");
-    s_ksyms_ready = true;
-}
-
-void dump_backtrace(bool use_ksyms)
-{
-    if (!current) {
-        HANG;
-        return;
-    }
-    if (use_ksyms && !ksyms_ready()) {
-        HANG;
-        return;
-    }
-    struct RecognizedSymbol {
-        dword address;
-        const KSym* ksym;
-    };
-    Vector<RecognizedSymbol> recognizedSymbols;
-    if (use_ksyms) {
-        for (dword* stackPtr = (dword*)&use_ksyms; current->isValidAddressForKernel(LinearAddress((dword)stackPtr)); stackPtr = (dword*)*stackPtr) {
-            dword retaddr = stackPtr[1];
-            if (auto* ksym = ksymbolicate(retaddr))
-                recognizedSymbols.append({ retaddr, ksym });
-        }
-    } else{
-        for (dword* stackPtr = (dword*)&use_ksyms; current->isValidAddressForKernel(LinearAddress((dword)stackPtr)); stackPtr = (dword*)*stackPtr) {
-            dword retaddr = stackPtr[1];
-            kprintf("%x (next: %x)\n", retaddr, stackPtr ? (dword*)*stackPtr : 0);
-        }
-        return;
-    }
-    size_t bytesNeeded = 0;
-    for (auto& symbol : recognizedSymbols) {
-        bytesNeeded += symbol.ksym->name.length() + 8 + 16;
-    }
-    for (auto& symbol : recognizedSymbols) {
-        unsigned offset = symbol.address - symbol.ksym->address;
-        dbgprintf("%p  %s +%u\n", symbol.address, symbol.ksym->name.characters(), offset);
-    }
-}
-#endif
+KeyboardDevice* keyboard;
+PS2MouseDevice* ps2mouse;
+SB16* sb16;
+DebugLogDevice* dev_debuglog;
+NullDevice* dev_null;
+SerialDevice* ttyS0;
+SerialDevice* ttyS1;
+SerialDevice* ttyS2;
+SerialDevice* ttyS3;
+VFS* vfs;
 
 #ifdef STRESS_TEST_SPAWNING
-static void spawn_stress() NORETURN;
-static void spawn_stress()
+[[noreturn]] static void spawn_stress()
 {
-    dword lastAlloc = sum_alloc;
+    u32 last_sum_alloc = sum_alloc;
 
     for (unsigned i = 0; i < 10000; ++i) {
         int error;
-        Process::create_user_process("/bin/id", (uid_t)100, (gid_t)100, (pid_t)0, error, Vector<String>(), Vector<String>(), tty0);
-        kprintf("malloc stats: alloc:%u free:%u page_aligned:%u eternal:%u\n", sum_alloc, sum_free, kmalloc_page_aligned, kmalloc_sum_eternal);
-        kprintf("delta:%u\n", sum_alloc - lastAlloc);
-        lastAlloc = sum_alloc;
+        Process::create_user_process("/bin/true", (uid_t)100, (gid_t)100, (pid_t)0, error, {}, {}, tty0);
+        dbgprintf("malloc stats: alloc:%u free:%u eternal:%u !delta:%u\n", sum_alloc, sum_free, kmalloc_sum_eternal, sum_alloc - last_sum_alloc);
+        last_sum_alloc = sum_alloc;
         sleep(60);
     }
     for (;;) {
@@ -168,84 +67,108 @@ static void spawn_stress()
 }
 #endif
 
-static void init_stage2() NORETURN;
-static void init_stage2()
+[[noreturn]] static void init_stage2()
 {
     Syscall::initialize();
 
-    auto vfs = make<VFS>();
-
     auto dev_zero = make<ZeroDevice>();
-    vfs->register_character_device(*dev_zero);
-
-    auto dev_null = make<NullDevice>();
-    vfs->register_character_device(*dev_null);
-
     auto dev_full = make<FullDevice>();
-    vfs->register_character_device(*dev_full);
-
     auto dev_random = make<RandomDevice>();
-    vfs->register_character_device(*dev_random);
+    auto dev_ptmx = make<PTYMultiplexer>();
 
-    vfs->register_character_device(*keyboard);
-
-    vfs->register_character_device(*tty0);
-    vfs->register_character_device(*tty1);
-    vfs->register_character_device(*tty2);
-    vfs->register_character_device(*tty3);
-
-    auto dev_hd0 = IDEDiskDevice::create();
-    auto e2fs = Ext2FS::create(dev_hd0.copyRef());
-    e2fs->initialize();
-
-    vfs->mount_root(e2fs.copyRef());
-
-#ifdef KSYMS
-    {
-        int error;
-        auto descriptor = vfs->open("/kernel.map", error);
-        if (!descriptor) {
-            kprintf("Failed to open /kernel.map\n");
-        } else {
-            auto buffer = descriptor->readEntireFile();
-            ASSERT(buffer);
-            loadKsyms(buffer);
-        }
+    auto root = KParams::the().get("root");
+    if (root.is_empty()) {
+        root = "/dev/hda";
     }
-#endif
+
+    if (!root.starts_with("/dev/hda")) {
+        kprintf("init_stage2: root filesystem must be on the first IDE hard drive (/dev/hda)\n");
+        hang();
+    }
+
+    auto dev_hd0 = IDEDiskDevice::create(IDEDiskDevice::DriveType::MASTER);
+
+    NonnullRefPtr<DiskDevice> root_dev = dev_hd0;
+
+    root = root.substring(strlen("/dev/hda"), root.length() - strlen("/dev/hda"));
+
+    if (root.length()) {
+        bool ok;
+        unsigned partition_number = root.to_uint(ok);
+
+        if (!ok) {
+            kprintf("init_stage2: couldn't parse partition number from root kernel parameter\n");
+            hang();
+        }
+
+        if (partition_number < 1 || partition_number > 4) {
+            kprintf("init_stage2: invalid partition number %d; expected 1 to 4\n", partition_number);
+            hang();
+        }
+
+        MBRPartitionTable mbr(root_dev);
+        if (!mbr.initialize()) {
+            kprintf("init_stage2: couldn't read MBR from disk\n");
+            hang();
+        }
+
+        auto partition = mbr.partition(partition_number);
+        if (!partition) {
+            kprintf("init_stage2: couldn't get partition %d\n", partition_number);
+            hang();
+        }
+
+        root_dev = *partition;
+    }
+
+    auto e2fs = Ext2FS::create(root_dev);
+    if (!e2fs->initialize()) {
+        kprintf("init_stage2: couldn't open root filesystem\n");
+        hang();
+    }
+
+    vfs->mount_root(e2fs);
+
+    dbgprintf("Load ksyms\n");
+    load_ksyms();
+    dbgprintf("Loaded ksyms\n");
 
     vfs->mount(ProcFS::the(), "/proc");
-
-    Vector<String> environment;
-    environment.append("TERM=ansi");
+    vfs->mount(DevPtsFS::the(), "/dev/pts");
 
     int error;
-    Process::create_user_process("/bin/sh", (uid_t)100, (gid_t)100, (pid_t)0, error, Vector<String>(), move(environment), tty0);
-#ifdef SPAWN_MULTIPLE_SHELLS
-    Process::create_user_process("/bin/sh", (uid_t)100, (gid_t)100, (pid_t)0, error, Vector<String>(), Vector<String>(), tty1);
-    Process::create_user_process("/bin/sh", (uid_t)100, (gid_t)100, (pid_t)0, error, Vector<String>(), Vector<String>(), tty2);
-    Process::create_user_process("/bin/sh", (uid_t)100, (gid_t)100, (pid_t)0, error, Vector<String>(), Vector<String>(), tty3);
-#endif
+
+    auto* system_server_process = Process::create_user_process("/bin/SystemServer", (uid_t)100, (gid_t)100, (pid_t)0, error, {}, {}, tty0);
+    if (error != 0) {
+        dbgprintf("init_stage2: error spawning SystemServer: %d\n", error);
+        hang();
+    }
+    system_server_process->set_priority(Process::HighPriority);
 
 #ifdef STRESS_TEST_SPAWNING
-    Process::create_kernel_process(spawn_stress, "spawn_stress");
+    Process::create_kernel_process("spawn_stress", spawn_stress);
 #endif
 
-    current->sys$exit(0);
+    current->process().sys$exit(0);
     ASSERT_NOT_REACHED();
 }
 
-void init() NORETURN;
-void init()
-{
-    cli();
+extern "C" {
+multiboot_info_t* multiboot_info_ptr;
+}
 
-#ifdef KSYMS
-    s_ksyms = nullptr;
-    s_ksyms_ready = false;
-#endif
+extern "C" [[noreturn]] void init()
+{
+    sse_init();
 
     kmalloc_init();
+    init_ksyms();
+
+    // must come after kmalloc_init because we use AK_MAKE_ETERNAL in KParams
+    new KParams(String(reinterpret_cast<const char*>(multiboot_info_ptr->cmdline)));
+
+    vfs = new VFS;
+    dev_debuglog = new DebugLogDevice;
 
     auto console = make<Console>();
 
@@ -254,7 +177,14 @@ void init()
     gdt_init();
     idt_init();
 
-    keyboard = new Keyboard;
+    keyboard = new KeyboardDevice;
+    ps2mouse = new PS2MouseDevice;
+    sb16 = new SB16;
+    dev_null = new NullDevice;
+    ttyS0 = new SerialDevice(SERIAL_COM1_ADDR, 64);
+    ttyS1 = new SerialDevice(SERIAL_COM2_ADDR, 65);
+    ttyS2 = new SerialDevice(SERIAL_COM3_ADDR, 66);
+    ttyS3 = new SerialDevice(SERIAL_COM4_ADDR, 67);
 
     VirtualConsole::initialize();
     tty0 = new VirtualConsole(0, VirtualConsole::AdoptCurrentVGABuffer);
@@ -266,25 +196,37 @@ void init()
     kprintf("Starting Serenity Operating System...\n");
 
     MemoryManager::initialize();
-
-    VFS::initialize_globals();
-    StringImpl::initializeGlobals();
-
     PIT::initialize();
 
-    memset(&system, 0, sizeof(system));
+    new BXVGADevice;
 
-    word base_memory = (CMOS::read(0x16) << 8) | CMOS::read(0x15);
-    word ext_memory = (CMOS::read(0x18) << 8) | CMOS::read(0x17);
+    auto e1000 = E1000NetworkAdapter::autodetect();
 
-    kprintf("%u kB base memory\n", base_memory);
-    kprintf("%u kB extended memory\n", ext_memory);
+    NonnullRefPtr<ProcFS> new_procfs = ProcFS::create();
+    new_procfs->initialize();
 
-    auto procfs = ProcFS::create();
-    procfs->initialize();
+    auto devptsfs = DevPtsFS::create();
+    devptsfs->initialize();
 
     Process::initialize();
-    Process::create_kernel_process(init_stage2, "init_stage2");
+    Thread::initialize();
+    Process::create_kernel_process("init_stage2", init_stage2);
+    Process::create_kernel_process("syncd", [] {
+        for (;;) {
+            Syscall::sync();
+            current->sleep(1 * TICKS_PER_SECOND);
+        }
+    });
+    Process::create_kernel_process("Finalizer", [] {
+        g_finalizer = current;
+        current->process().set_priority(Process::LowPriority);
+        for (;;) {
+            Thread::finalize_dying_threads();
+            current->block(Thread::BlockedLurking);
+            Scheduler::yield();
+        }
+    });
+    Process::create_kernel_process("NetworkTask", NetworkTask_main);
 
     Scheduler::pick_next();
 
@@ -294,19 +236,4 @@ void init()
     for (;;) {
         asm("hlt");
     }
-}
-
-void log_try_lock(const char* where)
-{
-    kprintf("[%u] >>> locking... (%s)\n", current->pid(), where);
-}
-
-void log_locked(const char* where)
-{
-    kprintf("[%u] >>> locked() in %s\n", current->pid(), where);
-}
-
-void log_unlocked(const char* where)
-{
-    kprintf("[%u] <<< unlocked()\n", current->pid(), where);
 }
